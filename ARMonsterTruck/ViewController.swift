@@ -31,6 +31,8 @@
 import UIKit
 import SceneKit
 import ARKit
+import CoreMotion
+
 
 // MARK: - Game State
 enum GameState: Int16 {
@@ -52,6 +54,7 @@ class ViewController: UIViewController {
     var wheelFRNode: SCNNode!
     var wheelRLNode: SCNNode!
     var wheelRRNode: SCNNode!
+    var groundNode: SCNNode!
     
     let wheelRadius: CGFloat = 0.04
     let wheelFrictionSlip: CGFloat = 0.9
@@ -61,6 +64,15 @@ class ViewController: UIViewController {
     let suspensionDamping: CGFloat = 2.0
     let suspensionStiffness: CGFloat = 2.0
     let suspensionCompression: CGFloat = 4.0
+    var isThrottling = false
+    var engineForce: CGFloat = 0
+    let defaultEngineForce: CGFloat = 10.0
+    var brakingForce: CGFloat = 0
+    let defaultBrakingForce: CGFloat = 0.01
+    let motionManager = CMMotionManager()
+    let steeringClamp: CGFloat = 0.6
+    var steeringAngle: CGFloat = 0
+    var maximumSpeed: CGFloat = 2.0
     
     var physicsVehicle:SCNPhysicsVehicle!
   
@@ -171,6 +183,47 @@ class ViewController: UIViewController {
   
   // MARK: Helper Functions
     
+    func startAccelerometer() {
+        // 1
+        guard motionManager.isAccelerometerAvailable else { return }
+        // 2
+        motionManager.accelerometerUpdateInterval = 1/60.0
+        // 3
+        motionManager.startAccelerometerUpdates(
+            to: OperationQueue.main,
+            withHandler: { (accelerometerData: CMAccelerometerData?,
+                error: Error?) in
+                self.updateSteeringAngle(acceleration:
+                    accelerometerData!.acceleration)
+        })
+    }
+    
+    func stopAccelerometer() {
+        motionManager.stopAccelerometerUpdates()
+    }
+    
+    func createFloorNode() -> SCNNode {
+        // 1
+        let floorGeometry = SCNFloor()
+        floorGeometry.reflectivity = 0.0
+        // 2
+        let floorMaterial = SCNMaterial()
+        floorMaterial.diffuse.contents = UIColor.white
+        floorMaterial.blendMode = .multiply
+        floorGeometry.materials = [floorMaterial]
+        // 3
+        let floorNode = SCNNode(geometry: floorGeometry)
+        // 4
+        floorNode.position = SCNVector3Zero
+        floorNode.physicsBody = SCNPhysicsBody(type: .static,
+                                               shape: nil)
+        floorNode.physicsBody?.restitution = 0.5
+        floorNode.physicsBody?.friction = 4.0
+        floorNode.physicsBody?.rollingFriction = 0.0
+        // 5
+        return floorNode
+    }
+    
     func createPhysicsVehicleWheel(wheelNode: SCNNode,
                                    position: SCNVector3) -> SCNPhysicsVehicleWheel {
         let wheel = SCNPhysicsVehicleWheel(node: wheelNode)
@@ -251,6 +304,54 @@ class ViewController: UIViewController {
   
   // MARK: Update Functions
     
+    func updateSteeringAngle(acceleration: CMAcceleration) {
+        steeringAngle = (CGFloat)(acceleration.y)
+        if steeringAngle < -steeringClamp {
+            steeringAngle = -steeringClamp;
+        } else if steeringAngle > steeringClamp {
+            steeringAngle = steeringClamp;
+        }
+    }
+    
+    func updateVehiclePhysics() {
+        // 1
+        guard self.gameState == .playGame else { return }
+        // 2
+        if isThrottling {
+            engineForce = defaultEngineForce
+            brakingForce = 0
+        } else {
+            engineForce = 0
+            brakingForce = defaultBrakingForce
+        }
+        // 3
+        physicsVehicle.applyEngineForce(engineForce, forWheelAt: 0)
+        physicsVehicle.applyEngineForce(engineForce, forWheelAt: 1)
+        physicsVehicle.applyEngineForce(engineForce, forWheelAt: 2)
+        physicsVehicle.applyEngineForce(engineForce, forWheelAt: 3)
+        
+        physicsVehicle.applyBrakingForce(brakingForce, forWheelAt: 0)
+        physicsVehicle.applyBrakingForce(brakingForce, forWheelAt: 1)
+        physicsVehicle.applyBrakingForce(brakingForce, forWheelAt: 2)
+        physicsVehicle.applyBrakingForce(brakingForce, forWheelAt: 3)
+        
+        physicsVehicle.setSteeringAngle(steeringAngle, forWheelAt: 0)
+        physicsVehicle.setSteeringAngle(steeringAngle, forWheelAt: 1)
+        
+        if self.physicsVehicle.speedInKilometersPerHour > maximumSpeed {
+            engineForce = 0.0
+        }
+    }
+    
+    override func touchesBegan(_ touches: Set<UITouch>,
+                               with event: UIEvent?) {
+        isThrottling = true
+    }
+    override func touchesEnded(_ touches: Set<UITouch>,
+                               with event: UIEvent?) {
+        isThrottling = false
+    }
+    
     func updatePositions() {
         // 1
         self.truckNode.position = self.focusNode.position
@@ -260,6 +361,8 @@ class ViewController: UIViewController {
         self.truckNode.physicsBody?.angularVelocity = SCNVector4Zero
         // 3
         self.truckNode.physicsBody?.resetTransform()
+        self.groundNode.position = self.focusNode.position
+        self.groundNode.physicsBody?.resetTransform()
     }
   
   func updateStatus() {
@@ -300,11 +403,31 @@ class ViewController: UIViewController {
   // MARK: Game Management
   
   func startGame() {
-    
+    // 1
+    guard self.gameState == .hitStartToPlay else { return }
+    // 2
+    DispatchQueue.main.async {
+        // 3
+        self.createVehiclePhysics()
+        self.updatePositions()
+        self.startAccelerometer()
+        self.groundNode.isHidden = false
+        self.truckNode.isHidden = false
+        self.gameState = .playGame
+    }
   }
   
   func resetGame(){
-    
+    // 1
+    guard self.gameState == .playGame else { return }
+    // 2
+    DispatchQueue.main.async {
+        // 3
+        self.truckNode.isHidden = true
+        self.groundNode.isHidden = true
+        self.stopAccelerometer()
+        self.gameState = .detectSurface
+    }
   }
   
   func loadModels() {
@@ -336,6 +459,11 @@ class ViewController: UIViewController {
     // 3
     truckNode.isHidden = true
     sceneView.scene.rootNode.addChildNode(truckNode)
+    
+    
+    groundNode = self.createFloorNode()
+    groundNode.isHidden = true
+    sceneView.scene.rootNode.addChildNode(groundNode)
   }
 }
 
@@ -350,6 +478,7 @@ extension ViewController : ARSCNViewDelegate {
     DispatchQueue.main.async {
       self.updateStatus()
       self.updateFocusNode()
+        self.updateVehiclePhysics()
     }
   }
   
